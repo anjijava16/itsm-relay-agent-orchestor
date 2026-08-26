@@ -1,0 +1,124 @@
+name: itsm-agentic
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: itsm
+      POSTGRES_PASSWORD: itsm
+      POSTGRES_DB: itsm
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U itsm"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
+    ports: ["6379:6379"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+  opensearch:
+    image: opensearchproject/opensearch:2.17.0
+    environment:
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g"
+      - DISABLE_SECURITY_PLUGIN=true
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    ports: ["9200:9200"]
+    volumes: [osdata:/usr/share/opensearch/data]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      retries: 15
+
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.17.0
+    environment:
+      - OPENSEARCH_HOSTS=["http://opensearch:9200"]
+      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
+    ports: ["5601:5601"]
+    depends_on: [opensearch]
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports: ["9000:9000", "9001:9001"]
+    volumes: [miniodata:/data]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      retries: 10
+
+  api:
+    build: .
+    env_file: .env
+    environment:
+      POSTGRES_DSN: postgresql+asyncpg://itsm:itsm@postgres:5432/itsm
+      POSTGRES_SYNC_DSN: postgresql://itsm:itsm@postgres:5432/itsm
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      OPENSEARCH_HOSTS: '["http://opensearch:9200"]'
+      AWS_ENDPOINT_URL: http://minio:9000
+    ports: ["8000:8000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      opensearch: { condition: service_healthy }
+    command: >
+      sh -c "alembic upgrade head &&
+             python scripts/bootstrap.py &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    volumes: ["./app:/srv/app"]
+
+  worker:
+    build: .
+    env_file: .env
+    environment:
+      POSTGRES_DSN: postgresql+asyncpg://itsm:itsm@postgres:5432/itsm
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      OPENSEARCH_HOSTS: '["http://opensearch:9200"]'
+      AWS_ENDPOINT_URL: http://minio:9000
+    depends_on: [postgres, redis, opensearch, minio]
+    command: celery -A app.workers.celery_app.celery_app worker -Q ingestion,maintenance -l info --concurrency=4
+    volumes: ["./app:/srv/app"]
+
+  beat:
+    build: .
+    env_file: .env
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    depends_on: [redis]
+    command: celery -A app.workers.celery_app.celery_app beat -l info
+
+  flower:
+    build: .
+    env_file: .env
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/1
+    ports: ["5555:5555"]
+    depends_on: [redis]
+    command: celery -A app.workers.celery_app.celery_app flower --port=5555
+
+volumes:
+  pgdata:
+  redisdata:
+  osdata:
+  miniodata:
